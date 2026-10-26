@@ -1,0 +1,17 @@
+[server]
+# lets the video player load videos from the ./static folder (needed for the text overlay)
+enableStaticServing = true
+maxUploadSize = 55     # MB - matches the free Supabase limit of 50 MB per file
+
+[client]
+toolbarMode = "minimal"      # hides the Deploy button / dev menu
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "dark"
+primaryColor = "#fe2c55"
+backgroundColor = "#000000"
+secondaryBackgroundColor = "#121212"
+textColor = "#ffffff"
