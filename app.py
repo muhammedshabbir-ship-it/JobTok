@@ -31,6 +31,13 @@ from urllib.parse import quote
 import streamlit as st
 import streamlit.components.v1 as components
 
+try:                                   # only needed when you use a cloud database (DATABASE_URL)
+    import psycopg2
+    import psycopg2.extras
+    import psycopg2.pool
+except ImportError:                    # local SQLite mode works without it
+    psycopg2 = None
+
 # ----------------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------------
@@ -134,7 +141,7 @@ def nav_style():
     div[data-baseweb="tab-highlight"] {{ background-color: #fe2c55 !important; }}
     @media (max-width: 640px) {{ .st-key-page label {{ padding: 7px 8px; }} }}
     /* ---------- action rail on top of videos ---------- */
-    [class*="st-key-vc_"] {{ position: relative; }}
+    [class*="st-key-vc_"] {{ position: relative; width: 100% !important; max-width: 420px; margin: 0 auto; }}
     [class*="st-key-rail_"] {{ position: absolute !important; right: 10px; bottom: 74px; width: 54px !important;
         z-index: 30; display: flex; flex-direction: column; gap: 8px; }}
     [class*="st-key-rail_"] [data-testid="stElementContainer"] {{ width: 100% !important; }}
@@ -206,11 +213,11 @@ CREATE TABLE IF NOT EXISTS companies(
 );
 CREATE TABLE IF NOT EXISTS experiences(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER, role TEXT, company TEXT, start TEXT, end TEXT, description TEXT
+    user_id INTEGER, role TEXT, company TEXT, start TEXT, "end" TEXT, description TEXT
 );
 CREATE TABLE IF NOT EXISTS posts(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER, body TEXT, image_path TEXT,
+    user_id INTEGER, body TEXT, image_path TEXT, video_path TEXT,
     created TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS likes(
@@ -248,8 +255,11 @@ CREATE TABLE IF NOT EXISTS messages(
     created TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS email_codes(
-    email TEXT PRIMARY KEY, salt TEXT, code_hash TEXT, expires REAL, attempts INTEGER DEFAULT 0,
-    last_sent REAL, window_start REAL, sends INTEGER DEFAULT 0
+    email TEXT PRIMARY KEY, salt TEXT, code_hash TEXT, expires DOUBLE PRECISION, attempts INTEGER DEFAULT 0,
+    last_sent DOUBLE PRECISION, window_start DOUBLE PRECISION, sends INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS sessions(
+    token_hash TEXT PRIMARY KEY, user_id INTEGER, created DOUBLE PRECISION, expires DOUBLE PRECISION
 );
 CREATE TABLE IF NOT EXISTS shortlist(
     company_id INTEGER, seeker_id INTEGER,
@@ -258,7 +268,68 @@ CREATE TABLE IF NOT EXISTS shortlist(
 """
 
 
+def db_url():
+    """DATABASE_URL (Postgres, e.g. Supabase) makes accounts permanent. Empty = local SQLite file."""
+    return _setting("DATABASE_URL")
+
+
+INTEGRITY_ERRORS = (sqlite3.IntegrityError,) + ((psycopg2.IntegrityError,) if psycopg2 else ())
+ID_TABLES = {"users", "experiences", "posts", "comments", "jobs", "applications", "connections", "messages"}
+
+
+@st.cache_resource
+def _pg_pool(url):
+    return psycopg2.pool.ThreadedConnectionPool(1, 10, dsn=url, connect_timeout=15)
+
+
+def _pg_sql(sql):
+    """Translate the (SQLite flavoured) SQL used by the app to Postgres."""
+    out = sql.replace("%", "%%").replace("?", "%s")
+    out = out.replace("CURRENT_TIMESTAMP", "(NOW() AT TIME ZONE 'UTC')")
+    out = out.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+    if re.match(r"\s*INSERT OR IGNORE INTO", out, re.I):
+        out = re.sub(r"INSERT OR IGNORE INTO", "INSERT INTO", out, count=1, flags=re.I) + " ON CONFLICT DO NOTHING"
+    m = re.match(r"\s*INSERT INTO\s+(\w+)", out, re.I)
+    returning = bool(m and m.group(1).lower() in ID_TABLES and "RETURNING" not in out.upper())
+    if returning:
+        out += " RETURNING id"
+    return out, returning
+
+
+def _run_pg(sql, params, fetch):
+    if psycopg2 is None:
+        raise RuntimeError("DATABASE_URL is set but psycopg2 is not installed. Add psycopg2-binary to requirements.txt.")
+    pool = _pg_pool(db_url())
+    psql, returning = _pg_sql(sql)
+    for attempt in (0, 1):
+        conn = pool.getconn()
+        try:
+            conn.autocommit = True
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(psql, params)
+                rows, last = None, None
+                if returning:
+                    r = cur.fetchone()
+                    last = r["id"] if r else None
+                elif fetch:
+                    rows = []
+                    for r in cur.fetchall():
+                        rows.append({k: (v.strftime("%Y-%m-%d %H:%M:%S") if isinstance(v, datetime) else v)
+                                     for k, v in r.items()})
+            pool.putconn(conn)
+            return rows, last
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            pool.putconn(conn, close=True)           # the server dropped an idle connection: retry once
+            if attempt:
+                raise
+        except Exception:
+            pool.putconn(conn)
+            raise
+
+
 def _run(sql, params=(), fetch=True):
+    if db_url():
+        return _run_pg(sql, params, fetch)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     try:
@@ -285,15 +356,23 @@ def ex(sql, params=()):
 
 @st.cache_resource
 def init_db():
+    if db_url():
+        for stmt in SCHEMA.split(";"):
+            if stmt.strip():
+                ex(stmt)
+        ex("ALTER TABLE posts ADD COLUMN IF NOT EXISTS video_path TEXT")
+        return True
     conn = sqlite3.connect(DB_PATH)
     conn.executescript(SCHEMA)
     conn.commit()
     conn.close()
     # migrate databases created by older versions of the app
-    cols = {r["name"] for r in q("PRAGMA table_info(seekers)")}
-    for col, typ in [("headline", "TEXT"), ("photo_path", "TEXT"), ("open_to_work", "INTEGER DEFAULT 1")]:
-        if col not in cols:
-            ex(f"ALTER TABLE seekers ADD COLUMN {col} {typ}")
+    for table, wanted in [("seekers", [("headline", "TEXT"), ("photo_path", "TEXT"), ("open_to_work", "INTEGER DEFAULT 1")]),
+                          ("posts", [("video_path", "TEXT")])]:
+        cols = {r["name"] for r in q(f"PRAGMA table_info({table})")}
+        for col, typ in wanted:
+            if col not in cols:
+                ex(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
     # older versions kept files in uploads/; videos now live in static/ so the player can stream them
     old = Path("uploads")
     if old.is_dir():
@@ -341,7 +420,7 @@ def create_user(role, name, email, salt, pw_hash):
         uid = ex("INSERT INTO users(role,name,email,salt,pw_hash) VALUES(?,?,?,?,?)",
                  (role, name.strip(), email.strip().lower(), salt, pw_hash))
         return uid, None
-    except sqlite3.IntegrityError:
+    except INTEGRITY_ERRORS:
         return None, "This email is already registered."
 
 
@@ -461,8 +540,12 @@ def issue_code(email):
             sends, window = (row["sends"] or 0) + 1, row["window_start"]
     code = f"{secrets.randbelow(10 ** 6):06d}"
     salt = secrets.token_hex(8)
-    ex("""INSERT OR REPLACE INTO email_codes(email,salt,code_hash,expires,attempts,last_sent,window_start,sends)
-          VALUES(?,?,?,?,0,?,?,?)""", (email, salt, _code_hash(salt, code), now + CODE_TTL, now, window, sends))
+    ex("""INSERT INTO email_codes(email,salt,code_hash,expires,attempts,last_sent,window_start,sends)
+          VALUES(?,?,?,?,0,?,?,?)
+          ON CONFLICT(email) DO UPDATE SET salt=excluded.salt, code_hash=excluded.code_hash,
+            expires=excluded.expires, attempts=0, last_sent=excluded.last_sent,
+            window_start=excluded.window_start, sends=excluded.sends""",
+       (email, salt, _code_hash(salt, code), now + CODE_TTL, now, window, sends))
     return code, None
 
 
@@ -490,6 +573,78 @@ def login(email, password):
     return None
 
 
+# ---------- stay logged in until the user logs out ----------
+COOKIE = "jobtok_login"
+LOGIN_DAYS = 365 * 5                      # server side; the user stays in until they press Log out
+
+
+def _tok_hash(token):
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def remember_login(uid):
+    """Create a login token; it is sent to the browser (cookie) on the next page draw."""
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    ex("DELETE FROM sessions WHERE expires<?", (now,))
+    ex("INSERT INTO sessions(token_hash, user_id, created, expires) VALUES(?,?,?,?)",
+       (_tok_hash(token), uid, now, now + LOGIN_DAYS * 86400))
+    st.session_state["_cookie_set"] = token
+
+
+def restore_login():
+    """New visit / refresh / app reopened: log the user in again from the saved cookie."""
+    try:
+        token = st.context.cookies.get(COOKIE)
+    except Exception:
+        return None
+    if not token or not isinstance(token, str):
+        return None
+    row = q1("SELECT s.user_id, s.expires, u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=?",
+             (_tok_hash(token),))
+    if not row or row["expires"] < time.time():
+        return None
+    st.session_state["_cookie_set"] = token              # refresh the cookie lifetime
+    ex("UPDATE sessions SET expires=? WHERE token_hash=?", (time.time() + LOGIN_DAYS * 86400, _tok_hash(token)))
+    return {"id": row["user_id"], "role": row["role"], "name": row["name"], "email": row["email"]}
+
+
+def forget_login(uid=None, everywhere=False):
+    """Log out: remove this browser's token (or every token of the user)."""
+    if everywhere and uid:
+        ex("DELETE FROM sessions WHERE user_id=?", (uid,))
+        return
+    try:
+        token = st.context.cookies.get(COOKIE)
+    except Exception:
+        token = None
+    if token and isinstance(token, str):
+        ex("DELETE FROM sessions WHERE token_hash=?", (_tok_hash(token),))
+
+
+def sync_cookie():
+    """Write or clear the browser cookie when a login/logout just happened."""
+    token = st.session_state.pop("_cookie_set", None)
+    clear = st.session_state.pop("_cookie_clear", False) if token is None else False
+    if token is None and not clear:
+        return
+    val, age = (token, 400 * 86400) if token else ("", 0)
+    js = ("<script>try{var h=window.parent.location.protocol==='https:'?';Secure':'';"
+          f"window.parent.document.cookie='{COOKIE}={val};max-age={age};path=/;SameSite=Lax'+h;"
+          "}catch(e){}</script>")
+    if hasattr(st, "iframe"):
+        st.iframe(js, height=1)
+    else:
+        components.html(js, height=0)
+
+
+def do_logout(me=None):
+    forget_login()
+    st.session_state.clear()
+    st.session_state["_cookie_clear"] = True
+    st.rerun()
+
+
 def video_duration(path: str):
     try:
         import cv2
@@ -505,8 +660,57 @@ def video_duration(path: str):
     return None
 
 
+# ---- permanent file storage (Supabase Storage). Without SUPABASE_URL the files stay in ./static (temporary on cloud hosts)
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB") or 50)          # Supabase free plan allows 50 MB per file
+MIME = {".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm", ".m4v": "video/x-m4v", ".jpg": "image/jpeg"}
+
+
+def storage_conf():
+    url, key = _setting("SUPABASE_URL"), _setting("SUPABASE_SERVICE_KEY")
+    if not (url and key):
+        return None
+    return dict(url=str(url).strip().rstrip("/"), key=str(key).strip(), bucket=_setting("SUPABASE_BUCKET", "jobtok"))
+
+
+def is_url(path):
+    return isinstance(path, str) and path.startswith(("http://", "https://"))
+
+
+@st.cache_resource
+def _ensure_bucket(url, key, bucket):
+    import requests
+
+    try:                                   # creates a PUBLIC bucket; an error just means it already exists
+        requests.post(f"{url}/storage/v1/bucket", timeout=20, json={"id": bucket, "name": bucket, "public": True},
+                      headers={"Authorization": f"Bearer {key}", "apikey": key})
+    except Exception:
+        pass
+    return True
+
+
+def store_file(local_path, content_type):
+    """Move a finished local file to permanent storage. Returns the public URL (or the local path if not configured)."""
+    c = storage_conf()
+    local_path = Path(local_path)
+    if not c:
+        return str(local_path)
+    import requests
+
+    _ensure_bucket(c["url"], c["key"], c["bucket"])
+    with open(local_path, "rb") as f:
+        r = requests.post(f"{c['url']}/storage/v1/object/{c['bucket']}/{local_path.name}", data=f, timeout=600,
+                          headers={"Authorization": f"Bearer {c['key']}", "apikey": c["key"],
+                                   "Content-Type": content_type, "x-upsert": "true"})
+    if r.status_code >= 300:
+        raise RuntimeError(f"storage upload failed ({r.status_code}): {r.text[:200]}")
+    local_path.unlink(missing_ok=True)
+    return f"{c['url']}/storage/v1/object/public/{c['bucket']}/{local_path.name}"
+
+
 def save_video(uploaded):
-    """Validate (<= 30 s) and store the video. Returns (path, error)."""
+    """Validate (size, <= 30 s) and store the video. Returns (path_or_url, error)."""
+    if uploaded.size > MAX_UPLOAD_MB * 1024 * 1024:
+        return None, f"This video is {uploaded.size / 1048576:.0f} MB. Please keep it under {MAX_UPLOAD_MB} MB."
     suffix = Path(uploaded.name).suffix.lower() or ".mp4"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(uploaded.getbuffer())
@@ -517,11 +721,16 @@ def save_video(uploaded):
         return None, f"Your video is {dur:.0f} seconds long. Please keep it to {MAX_SECONDS} seconds or less."
     dest = UPLOAD_DIR / f"{uuid.uuid4().hex}{suffix}"
     shutil.move(str(tmp_path), dest)
-    return str(dest), None
+    try:
+        return store_file(dest, MIME.get(suffix, "video/mp4")), None
+    except Exception as e:
+        dest.unlink(missing_ok=True)
+        print(f"[JobTok] {e}", flush=True)
+        return None, "Could not save the video to storage. Please try again in a moment."
 
 
 def save_image(uploaded, size=None, max_side=1080):
-    """Resize + store an image as JPEG. Returns (path, error)."""
+    """Resize + store an image as JPEG. Returns (path_or_url, error)."""
     try:
         from PIL import Image, ImageOps
 
@@ -532,18 +741,37 @@ def save_image(uploaded, size=None, max_side=1080):
             img.thumbnail((max_side, max_side))
         dest = UPLOAD_DIR / f"{uuid.uuid4().hex}.jpg"
         img.save(dest, "JPEG", quality=85)
-        return str(dest), None
     except Exception:
         return None, "Could not read that image. Please use a JPG or PNG."
+    try:
+        return store_file(dest, "image/jpeg"), None
+    except Exception as e:
+        dest.unlink(missing_ok=True)
+        print(f"[JobTok] {e}", flush=True)
+        return None, "Could not save the image to storage. Please try again in a moment."
 
 
 def drop_file(path):
-    if path:
-        Path(path).unlink(missing_ok=True)
+    """Delete an old file (local file, or an object in our storage bucket)."""
+    if not path:
+        return
+    if is_url(path):
+        c = storage_conf()
+        prefix = f"{c['url']}/storage/v1/object/public/{c['bucket']}/" if c else None
+        if c and path.startswith(prefix):
+            try:
+                import requests
+
+                requests.delete(f"{c['url']}/storage/v1/object/{c['bucket']}/{path[len(prefix):]}", timeout=20,
+                                headers={"Authorization": f"Bearer {c['key']}", "apikey": c["key"]})
+            except Exception:
+                pass
+        return
+    Path(path).unlink(missing_ok=True)
 
 
 def exists(path):
-    return bool(path) and Path(path).exists()
+    return bool(path) and (is_url(path) or Path(path).exists())
 
 
 # ----------------------------------------------------------------------------
@@ -571,6 +799,9 @@ def _b64(path, mtime):
 
 def avatar_html(p, size=48):
     path = p.get("photo_path")
+    if exists(path) and is_url(path):
+        return (f'<img src="{esc(path)}" loading="lazy" '
+                f'style="width:{size}px;height:{size}px;border-radius:50%;object-fit:cover;flex:none">')
     if exists(path):
         data = _b64(path, Path(path).stat().st_mtime)
         return (f'<img src="data:image/jpeg;base64,{data}" '
@@ -633,25 +864,33 @@ def job_overlay(j, company_name=""):
     return dict(title=j["title"], subtitle=company_name, items=items, badge="Hiring")
 
 
-def video_player(path, title="", subtitle="", items=(), badge="", height=540):
-    """Autoplaying (muted) video with info that fades in one line at a time, TikTok style."""
+VIDEO_RATIO = "4 / 5"      # every video uses the SAME box: 4 wide x 5 tall (cropped to fill, no black bars)
+VIDEO_MAX_W = 420          # px - the box never gets wider than this
+
+
+def video_player(path, title="", subtitle="", items=(), badge=""):
+    """One uniform video box: autoplays muted when on screen, closes (pause + reset + unload) when scrolled away,
+    only one plays at a time, and info lines fade in over the video one by one."""
     if not exists(path):
         return
-    p = Path(path)
-    if not (st.get_option("server.enableStaticServing") and p.parent.name == UPLOAD_DIR.name):
-        # static serving is off: plain player + the same info as a caption
-        st.video(path)
-        if items:
-            st.caption("  •  ".join(items))
-        return
-    url = f"/app/static/{quote(p.name)}"
+    if is_url(path):
+        url = path
+    else:
+        p = Path(path)
+        if not (st.get_option("server.enableStaticServing") and p.parent.name == UPLOAD_DIR.name):
+            st.video(path)                       # static serving is off: plain player + info as a caption
+            if items:
+                st.caption("  •  ".join(items))
+            return
+        url = f"/app/static/{quote(p.name)}"
     pills = "".join(f'<div class="pill">{esc(t)}</div>' for t in items)
     badge_html = f'<span class="bdg">{esc(badge)}</span>' if badge else ""
     doc = f"""
 <style>
   html,body{{margin:0;background:transparent;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}}
-  .w{{position:relative;width:100%;height:min({height}px,125vw);border-radius:18px;overflow:hidden;background:#000}}
-  video{{width:100%;height:100%;object-fit:contain;background:#000}}
+  .w{{position:relative;width:100%;max-width:{VIDEO_MAX_W}px;margin:0 auto;aspect-ratio:{VIDEO_RATIO};border-radius:18px;
+     overflow:hidden;background:#111}}
+  video{{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;background:#111}}
   .top{{position:absolute;left:0;right:0;top:0;padding:14px 16px 28px;color:#fff;pointer-events:none;
        background:linear-gradient(180deg,rgba(0,0,0,.75),rgba(0,0,0,0))}}
   .top b{{font-size:19px;text-shadow:0 1px 4px #000}}
@@ -666,31 +905,41 @@ def video_player(path, title="", subtitle="", items=(), badge="", height=540):
   .mute{{position:absolute;right:12px;top:12px;width:38px;height:38px;border-radius:50%;border:0;cursor:pointer;
         background:rgba(0,0,0,.55);color:#fff;font-size:18px}}
 </style>
-<div class="w">
-  <video id="v" src="{url}" muted loop playsinline preload="metadata" controls controlsList="nodownload"></video>
+<div class="w" id="box">
+  <video id="v" data-src="{esc(url)}" muted loop playsinline preload="metadata" controls controlsList="nodownload"></video>
   <div class="top"><b>{esc(title)}</b>{badge_html}<small>{esc(subtitle)}</small></div>
   <div class="ov">{pills}</div>
   <button class="mute" id="m" title="Sound on/off">🔇</button>
 </div>
 <script>
-  const v=document.getElementById('v'), m=document.getElementById('m');
-  const pills=[...document.querySelectorAll('.pill')];
+  const v=document.getElementById('v'), m=document.getElementById('m'), box=document.getElementById('box');
+  const SRC=v.dataset.src, pills=[...document.querySelectorAll('.pill')];
+  const ME=Math.random().toString(36).slice(2);
+  const ch=('BroadcastChannel' in window)?new BroadcastChannel('jobtok-video'):null;
+  function pillsOff(){{pills.forEach(p=>p.classList.remove('on'));}}
+  function load(){{ if(v.getAttribute('src')!==SRC) v.src=SRC; }}
+  function closeIt(){{ v.pause(); try{{v.currentTime=0;}}catch(e){{}} pillsOff(); }}      // scrolled away: stop + rewind
+  function unload(){{ v.pause(); if(v.getAttribute('src')){{ v.removeAttribute('src'); v.load(); }} pillsOff(); }}  // far away: free memory
   function update(){{
     const dur=(isFinite(v.duration)&&v.duration>4)?v.duration:30;
     const step=Math.min(2.2,(dur-1.5)/(pills.length+1));
     pills.forEach((p,i)=>p.classList.toggle('on', v.currentTime>=0.7+i*step));
   }}
-  v.addEventListener('timeupdate',update); v.addEventListener('seeked',update);
-  v.addEventListener('loadedmetadata',update);
+  v.addEventListener('timeupdate',update); v.addEventListener('seeked',update); v.addEventListener('loadedmetadata',update);
+  v.addEventListener('play',()=>{{ if(ch) ch.postMessage(ME); }});                         // tell the other videos to stop
+  if(ch) ch.onmessage=e=>{{ if(e.data!==ME && !v.paused) v.pause(); }};
   m.onclick=()=>{{v.muted=!v.muted; m.textContent=v.muted?'🔇':'🔊';}};
   new IntersectionObserver(es=>es.forEach(e=>{{
-      if(e.isIntersecting){{v.play().catch(()=>{{}});}} else {{v.pause();}}
-  }}),{{threshold:0.5}}).observe(v);
+      if(e.intersectionRatio>=0.6){{ load(); v.play().catch(()=>{{}}); }}
+      else if(e.intersectionRatio<0.25){{ closeIt(); }}
+  }}),{{threshold:[0,0.25,0.6]}}).observe(box);
+  new IntersectionObserver(es=>es.forEach(e=>{{ if(e.isIntersecting) load(); else unload(); }}),
+      {{rootMargin:'900px 0px 900px 0px'}}).observe(box);
 </script>"""
     if hasattr(st, "iframe"):          # st.components.v1.html is deprecated in newer Streamlit
         st.iframe(doc, height="content")
     else:
-        components.html(doc, height=height + 4)
+        components.html(doc, height=int(VIDEO_MAX_W * 5 / 4) + 4)
 
 
 def show_person_video(p):
@@ -1209,6 +1458,11 @@ def header():
 
 def auth_screen():
     header()
+    if st.session_state.get("flash"):
+        st.success(st.session_state.pop("flash"))
+    if not (db_url() and storage_conf()) and os.path.isdir("/mount/src"):      # running on Streamlit Community Cloud
+        st.warning("Storage is not connected: accounts and videos here are deleted whenever this app restarts. "
+                   "App owner: set DATABASE_URL and SUPABASE_URL / SUPABASE_SERVICE_KEY in the app Secrets (see README).")
     tab_in, tab_up = st.tabs(["Log in", "Sign up"])
     with tab_in:
         with st.form("login"):
@@ -1218,6 +1472,7 @@ def auth_screen():
                 user = login(email, pw)
                 if user:
                     st.session_state.user = user
+                    remember_login(user["id"])
                     st.rerun()
                 else:
                     st.error("Wrong email or password.")
@@ -1277,6 +1532,7 @@ def reset_flow():
             else:
                 salt = secrets.token_hex(8)
                 ex("UPDATE users SET salt=?, pw_hash=? WHERE email=?", (salt, hash_pw(pw, salt), rd["email"]))
+                ex("DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE email=?)", (rd["email"],))
                 st.session_state.pop("reset_data", None)
                 st.success("Password changed. You can log in now.")
     if st.button("↩ Use a different email", key="rs_back"):
@@ -1346,6 +1602,7 @@ def verify_step():
                     st.error(err)
                 else:
                     st.session_state.user = {"id": uid, "role": su["role"], "name": su["name"], "email": su["email"]}
+                    remember_login(uid)
                     st.session_state.pop("signup_data", None)
                     st.session_state.nav_to = "profile"
                     st.rerun()
@@ -1440,18 +1697,27 @@ def posts_page(me, role):
     with st.form("new_post", clear_on_submit=True):
         body = st.text_area("Start a post", placeholder="Share an update, a tip, or that you're hiring…",
                             max_chars=1000, height=90)
-        img = st.file_uploader("Add a photo (optional)", type=["jpg", "jpeg", "png"])
+        c1, c2 = st.columns(2)
+        img = c1.file_uploader("Photo (optional)", type=["jpg", "jpeg", "png"])
+        vid = c2.file_uploader(f"Video (max {MAX_SECONDS}s)", type=["mp4", "mov", "webm", "m4v"])
         if st.form_submit_button("📣 Post"):
             if not body.strip():
                 st.error("Write something first.")
             else:
-                path = None
+                path = vpath = None
                 if img is not None:
                     path, err = save_image(img)
                     if err:
                         st.error(err)
                         return
-                ex("INSERT INTO posts(user_id,body,image_path) VALUES(?,?,?)", (me, body.strip(), path))
+                if vid is not None:
+                    vpath, err = save_video(vid)
+                    if err:
+                        drop_file(path)
+                        st.error(err)
+                        return
+                ex("INSERT INTO posts(user_id,body,image_path,video_path) VALUES(?,?,?,?)",
+                   (me, body.strip(), path, vpath))
                 st.rerun()
 
     scope = st.radio("Show", ["🌍 Everyone", "🤝 My network"], horizontal=True, label_visibility="collapsed")
@@ -1470,6 +1736,9 @@ def posts_page(me, role):
                 continue
             person_header(author, 44, extra=ago(po["created"]))
             st.markdown(f'<div class="body">{safe(po["body"])}</div>', unsafe_allow_html=True)
+            if exists(po.get("video_path")):
+                with st.container(key=f"vc_post_{po['id']}"):
+                    video_player(po["video_path"], title=author["name"], subtitle=headline_of(author))
             if exists(po["image_path"]):
                 st.image(po["image_path"])
             c1, c2, c3, c4 = st.columns(4)
@@ -1484,6 +1753,7 @@ def posts_page(me, role):
             with c4:
                 if po["user_id"] == me and st.button("🗑 Delete", key=f"pd_{po['id']}"):
                     drop_file(po["image_path"])
+                    drop_file(po.get("video_path"))
                     ex("DELETE FROM posts WHERE id=?", (po["id"],))
                     st.rerun()
             comments_block("post", po["id"], me, "ps")
@@ -1675,8 +1945,10 @@ def network_page(me, role):
 # Page: Messages
 # ----------------------------------------------------------------------------
 def messages_page(me, role):
-    rows = q("""SELECT DISTINCT CASE WHEN from_id=? THEN to_id ELSE from_id END AS pid
-                FROM messages WHERE from_id=? OR to_id=? ORDER BY id DESC""", (me, me, me))
+    rows = q("""SELECT pid FROM (
+                   SELECT CASE WHEN from_id=? THEN to_id ELSE from_id END AS pid, MAX(id) AS last_id
+                   FROM messages WHERE from_id=? OR to_id=? GROUP BY CASE WHEN from_id=? THEN to_id ELSE from_id END
+                ) t ORDER BY last_id DESC""", (me, me, me, me))
     options = [r["pid"] for r in rows]
     for cid in my_connection_ids(me):
         if cid not in options:
@@ -1801,10 +2073,68 @@ def completeness(p, n_exp):
     return done / len(checks), [n for n, ok in checks if not ok]
 
 
+def delete_account(uid):
+    """Permanently remove a user and everything that belongs to them (rows AND files)."""
+    u = q1("SELECT email FROM users WHERE id=?", (uid,))
+    if not u:
+        return
+    files = []
+    for r in q("SELECT video_path, photo_path FROM seekers WHERE user_id=?", (uid,)):
+        files += [r["video_path"], r["photo_path"]]
+    files += [r["photo_path"] for r in q("SELECT photo_path FROM companies WHERE user_id=?", (uid,))]
+    posts = q("SELECT id, image_path, video_path FROM posts WHERE user_id=?", (uid,))
+    jobs = q("SELECT id, video_path FROM jobs WHERE company_id=?", (uid,))
+    for po in posts:
+        files += [po["image_path"], po["video_path"]]
+        ex("DELETE FROM likes WHERE kind='post' AND target_id=?", (po["id"],))
+        ex("DELETE FROM comments WHERE kind='post' AND target_id=?", (po["id"],))
+    for j in jobs:
+        files.append(j["video_path"])
+        ex("DELETE FROM applications WHERE job_id=?", (j["id"],))
+        ex("DELETE FROM likes WHERE kind='job' AND target_id=?", (j["id"],))
+        ex("DELETE FROM comments WHERE kind='job' AND target_id=?", (j["id"],))
+    ex("DELETE FROM likes WHERE kind='video' AND target_id=?", (uid,))       # likes/comments on their video profile
+    ex("DELETE FROM comments WHERE kind='video' AND target_id=?", (uid,))
+    for sql in ("DELETE FROM likes WHERE user_id=?", "DELETE FROM comments WHERE user_id=?",
+                "DELETE FROM posts WHERE user_id=?", "DELETE FROM jobs WHERE company_id=?",
+                "DELETE FROM experiences WHERE user_id=?", "DELETE FROM seekers WHERE user_id=?",
+                "DELETE FROM companies WHERE user_id=?", "DELETE FROM applications WHERE seeker_id=?",
+                "DELETE FROM shortlist WHERE company_id=?", "DELETE FROM shortlist WHERE seeker_id=?"):
+        ex(sql, (uid,))
+    ex("DELETE FROM connections WHERE from_id=? OR to_id=?", (uid, uid))
+    ex("DELETE FROM messages WHERE from_id=? OR to_id=?", (uid, uid))
+    ex("DELETE FROM email_codes WHERE email=? OR email=?", (u["email"], "reset:" + u["email"]))
+    ex("DELETE FROM sessions WHERE user_id=?", (uid,))
+    ex("DELETE FROM users WHERE id=?", (uid,))
+    for f in files:
+        drop_file(f)
+
+
+def delete_account_ui(me):
+    with st.expander("⚠️ Delete my account"):
+        st.markdown("Your account stays on JobTok until **you** delete it. Deleting removes your profile, videos, "
+                    "photos, posts, jobs, messages and connections **forever**. This cannot be undone.")
+        with st.form("delete_account"):
+            pw = st.text_input("Type your password to confirm", type="password")
+            sure = st.checkbox("I understand this is permanent")
+            go = st.form_submit_button("🗑 Delete my account forever")
+        if go:
+            user = st.session_state.get("user") or {}
+            if not sure:
+                st.error("Please tick the box to confirm.")
+            elif not login(user.get("email", ""), pw):
+                st.error("Wrong password.")
+            else:
+                delete_account(me)
+                st.session_state.clear()
+                st.session_state["_cookie_clear"] = True
+                st.session_state["flash"] = "Your account and all its data were deleted."
+                st.rerun()
+
+
 def logout_button(key):
     if st.button("🚪 Log out", key=key):
-        st.session_state.clear()
-        st.rerun()
+        do_logout()
 
 
 def profile_page(me, role):
@@ -1831,6 +2161,7 @@ def profile_page(me, role):
             profile_view(me, me, role)
     st.divider()
     logout_button("logout_profile")
+    delete_account_ui(me)
 
 
 def seeker_edit(me, p):
@@ -1917,7 +2248,7 @@ def experience_tab(me):
         desc = st.text_area("What did you do?", max_chars=500, height=80)
         if st.form_submit_button("➕ Add"):
             if role_.strip():
-                ex("INSERT INTO experiences(user_id,role,company,start,end,description) VALUES(?,?,?,?,?,?)",
+                ex('INSERT INTO experiences(user_id,role,company,start,"end",description) VALUES(?,?,?,?,?,?)',
                    (me, role_.strip(), company.strip(), start.strip(), end.strip(), desc.strip()))
                 st.rerun()
             else:
@@ -2004,8 +2335,13 @@ def counts(me, role):
 def main():
     init_db()
     user = st.session_state.get("user")
+    if not user and not st.session_state.get("_cookie_clear"):
+        user = restore_login()
+        if user:
+            st.session_state.user = user
     if not user:
         auth_screen()
+        sync_cookie()
         return
     me, role = user["id"], user["role"]
     if not q1("SELECT 1 x FROM users WHERE id=?", (me,)):
@@ -2046,10 +2382,10 @@ def main():
                     unsafe_allow_html=True)
         st.caption("Use the menu bar at the top to move around.")
         if st.button("Log out"):
-            st.session_state.clear()
-            st.rerun()
+            do_logout()
 
     nav_style()
+    sync_cookie()
     header()
     st.radio("Menu", list(pages), format_func=label, key="page", horizontal=True, on_change=nav_changed,
              label_visibility="collapsed")
